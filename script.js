@@ -1,805 +1,999 @@
-// --- CONFIG & GLOBALS ---
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxGSOsV1HazZ-_4krq_ewUdfVLVYYLTU9kdkzX-rAzpNGGyr-RPhSU2YKtqzHJeUeJK/exec'; 
-const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 Menit ( dalam milidetik )
-const STORAGE_KEY_USER = 'jurnalku_user';
-const STORAGE_KEY_TIME = 'jurnalku_last_activity';
+// ==========================================
+// KONFIGURASI
+// ==========================================
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz-Hss2p0kFI8tns7yHO0UGKHMmU6Hvp27rI6quANmdJ4ZuBDwPP-tGqS_n1jDUzENk/exec'; // GANTI DENGAN URL ANDA
+const SESSION_DURATION = 24 * 60 * 60 * 1000;
 
+// ==========================================
+// STATE GLOBAL
+// ==========================================
 let user = null;
-let db = { kategori: [], transaksi: [], tabungan: [], summary_balances: [] };
-let sessionTimer;
+let authToken = null;
+let configData = [];
+let allTransactions = [];
+let targetsData = {};
+let parsedExcelData = null;
 
-// --- SESSION MANAGEMENT ---
+// ==========================================
+// UTILITIES
+// ==========================================
+function parseRupiah(str) {
+    if (!str) return 0;
+    if (typeof str === 'number') return str;
+    let cleaned = String(str).replace(/\./g, '').replace(/,/g, '.');
+    return parseFloat(cleaned) || 0;
+}
 
-// Cek sesi saat halaman dimuat
-window.onload = function() {
-    checkSession();
-    // Pasang listener untuk aktivitas user (mouse, keyboard, klik)
-    // agar tidak logout saat sedang bekerja
-    window.addEventListener('mousemove', resetTimer);
-    window.addEventListener('keypress', resetTimer);
-    window.addEventListener('click', resetTimer);
-};
+function formatRupiah(num) {
+    return Math.round(num).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+}
+
+function securePost(payload) {
+    if (authToken) payload.token = authToken;
+    return fetch(SCRIPT_URL, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+    }).then(r => r.json());
+}
+
+function showToast(msg) {
+    const t = document.getElementById('toast');
+    if (t) {
+        t.innerText = msg;
+        t.classList.add('show');
+        setTimeout(() => t.classList.remove('show'), 3000);
+    }
+}
+
+// ==========================================
+// AUTHENTICATION
+// ==========================================
+function doLogin() {
+    const pass = document.getElementById('login-pass').value.trim();
+    const msg = document.getElementById('login-msg');
+    if (!pass) return msg.innerText = "Masukkan password!";
+    msg.innerText = "Memproses...";
+
+    securePost({ action: 'login', password: pass })
+    .then(res => {
+        if (res.status === 'success') {
+            user = res.user;
+            authToken = res.token;
+            localStorage.setItem('app_session', JSON.stringify({
+                token: authToken, user: user, timestamp: Date.now()
+            }));
+            initApp();
+        } else {
+            msg.innerText = res.message;
+        }
+    })
+    .catch(() => msg.innerText = "Koneksi Error");
+}
+
+function doLogout() {
+    localStorage.removeItem('app_session');
+    user = null;
+    authToken = null;
+    location.reload();
+}
 
 function checkSession() {
-    const storedUser = localStorage.getItem(STORAGE_KEY_USER);
-    const storedTime = localStorage.getItem(STORAGE_KEY_TIME);
-    const now = Date.now();
+    const sessionStr = localStorage.getItem('app_session');
+    const loginMsg = document.getElementById('login-msg');
 
-    if (storedUser && storedTime) {
-        // Cek apakah waktu habis
-        if (now - parseInt(storedTime) > SESSION_TIMEOUT) {
-            doLogout(true); // Logout pakai karena timeout
-        } else {
-            // Masih login, restore data
-            user = JSON.parse(storedUser);
-            document.getElementById('login-view').classList.add('hidden');
-            document.getElementById('app-view').style.display = 'block';
-            initAppAfterLogin();
-            resetTimer(); // Mulai timer ulang
+    if (sessionStr) {
+        try {
+            const session = JSON.parse(sessionStr);
+            const elapsed = Date.now() - session.timestamp;
+
+            if (elapsed > SESSION_DURATION) {
+                localStorage.removeItem('app_session');
+                if (loginMsg) loginMsg.innerText = "Sesi login telah habis. Silakan login ulang.";
+            } else {
+                authToken = session.token;
+                user = session.user;
+                initApp();
+            }
+        } catch (e) {
+            localStorage.removeItem('app_session');
         }
-    } else {
-        // Belum ada sesi, tampilkan login
-        document.getElementById('login-view').classList.remove('hidden');
-        document.getElementById('app-view').style.display = 'none';
     }
 }
 
-function saveSession() {
-    localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
-    localStorage.setItem(STORAGE_KEY_TIME, Date.now().toString());
-}
+document.addEventListener('DOMContentLoaded', () => {
+    checkSession();
 
-function clearSession() {
-    localStorage.removeItem(STORAGE_KEY_USER);
-    localStorage.removeItem(STORAGE_KEY_TIME);
-    user = null;
-}
-
-function resetTimer() {
-    // Jika user belum login, jangan update timer
-    if (!user) return;
-    
-    localStorage.setItem(STORAGE_KEY_TIME, Date.now().toString());
-}
-
-// Fungsi Logout Manual (Tombol Keluar)
-function doLogout() {
-    if(confirm('Apakah Anda yakin ingin keluar?')) {
-        performLogout();
+    // Setup drag & drop untuk upload
+    const dropzone = document.getElementById('dropzone');
+    if (dropzone) {
+        ['dragenter', 'dragover'].forEach(evt => {
+            dropzone.addEventListener(evt, e => {
+                e.preventDefault();
+                dropzone.classList.add('dragover');
+            });
+        });
+        ['dragleave', 'drop'].forEach(evt => {
+            dropzone.addEventListener(evt, e => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+            });
+        });
+        dropzone.addEventListener('drop', e => {
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                const input = document.getElementById('excel-upload');
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                handleFileUpload({ target: input });
+            }
+        });
     }
-}
+});
 
-// Fungsi Logout Otomatis (Timeout)
-function doLogout(isTimeout = false) {
-    if (isTimeout) {
-        showToast("Sesi Anda telah berakhir. Silakan login kembali.", "error");
-    }
-    performLogout();
-}
+// ==========================================
+// INIT APP - MENU BERDASARKAN ROLE
+// ==========================================
+function initApp() {
+    document.getElementById('login-view').style.display = 'none';
+    document.getElementById('app-view').style.display = 'block';
+    document.getElementById('u-name').innerText = user.nama_admin;
+    document.getElementById('u-role').innerText = `${user.role} | ${user.kelompok || user.desa || ''}`;
 
-function performLogout() {
-    clearSession();
-    document.getElementById('app-view').style.display = 'none';
-    document.getElementById('login-view').classList.remove('hidden');
-    document.getElementById('login-pass').value = '';
-    document.getElementById('btn-login').innerText = 'MASUK';
-    document.getElementById('login-msg').innerText = '';
-}
+    const navUpload = document.getElementById('nav-upload');
+    const navConfig = document.getElementById('nav-config');
+    const navTargets = document.getElementById('nav-targets');
 
-// --- LOGIC APLIKASI ---
+    // Reset semua tab ke hidden dulu
+    navUpload.style.display = 'none';
+    navConfig.style.display = 'none';
+    navTargets.style.display = 'none';
 
-// Helpers
-const formatRp = (num) => "Rp " + Number(num).toLocaleString('id-ID');
-const parseRupiah = (str) => {
-    if(!str) return 0;
-    return parseInt(str.replace(/[^0-9]/g, '')) || 0;
-};
-
-function formatRupiahInput(el) {
-    let val = el.value.replace(/[^0-9]/g, '');
-    if (val) {
-        el.value = "Rp " + parseInt(val).toLocaleString('id-ID');
-    } else {
-        el.value = "";
-    }
-}
-
-function showToast(msg, type='success') {
-    const el = document.getElementById('toast');
-    el.className = type; 
-    el.innerHTML = `<i class="ph ${type==='success'?'ph-check-circle':'ph-warning-circle'}"></i> ${msg}`;
-    el.classList.add('show');
-    setTimeout(() => el.classList.remove('show'), 3000);
-};
-
-function getUserAkun() {
-    if (!user) return '';
-    if (user.role === 'Daerah') return 'Daerah';
-    if (user.role === 'Desa') return user.desa;
-    if (user.role === 'Kelompok') return user.kelompok;
-    return '';
-}
-
-// Inisialisasi setelah login sukses
-function initAppAfterLogin() {
-    const namaAkun = getUserAkun();
-    document.getElementById('header-detail').innerText = `Kelompok: ${user.kelompok || '-'}`;
-    document.getElementById('my-akun-display').innerText = namaAkun;
-
-    if(user.role === 'Desa' || user.role === 'Daerah') {
-        document.getElementById('monitor-section').classList.remove('hidden');
-    } else {
-        document.getElementById('monitor-section').classList.add('hidden');
+    if (user.role === 'Kelompok') {
+        navUpload.style.display = 'block';
+        document.getElementById('tpl-kelompok-name').innerText = user.kelompok || '-';
+        switchTab('upload');
+    } else if (user.role === 'Desa') {
+        switchTab('data');
+    } else if (user.role === 'Daerah') {
+        navConfig.style.display = 'block';
+        navTargets.style.display = 'block';
+        document.getElementById('filter-desa-container').style.display = 'block';
+        document.getElementById('filter-desa-rekap-container').style.display = 'block';
+        switchTab('data');
     }
 
-    showToast(`Selamat Datang, ${user.nama_admin}`);
-    initMonthFilter();
-    loadData();
+    fetchConfig();
 }
 
-// --- LOGIN ---
-function doLogin() {
-    const pass = document.getElementById('login-pass').value;
-    const msg = document.getElementById('login-msg');
-    const btn = document.getElementById('btn-login');
-    
-    if(!pass) return msg.innerText = "Password tidak boleh kosong";
-
-    btn.innerHTML = 'Memproses...';
-    msg.innerText = "";
-    msg.style.color = "var(--text-light)";
-
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify({action:'login', password:pass}) })
-    .then(r=>r.json()).then(res => {
-        if(res.status==='success'){
-            user = res.user;
-            
-            // Simpan sesi
-            saveSession();
-
-            document.getElementById('login-view').classList.add('hidden');
-            document.getElementById('app-view').style.display = 'block';
-            
-            initAppAfterLogin();
-        } else {
-            msg.innerText = "Login Gagal: " + (res.message || "Password Salah");
-            msg.style.color = "var(--danger)";
-            btn.innerHTML = 'MASUK';
-        }
-    }).catch(err => {
-        msg.innerText = "Koneksi Error. Coba lagi.";
-        msg.style.color = "var(--danger)";
-        btn.innerHTML = 'MASUK';
-    });
-}
-
-// --- FILTER BULAN ---
-function initMonthFilter() {
-    const sel = document.getElementById('filter-bulan');
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth() + 1;
-    let options = `<option value="all">Semua Periode</option>`;
-    for(let i=0; i<12; i++) {
-        let d = new Date(year, month - 1 - i, 1);
-        let yyyy = d.getFullYear();
-        let mm = String(d.getMonth() + 1).padStart(2, '0');
-        let val = `${yyyy}-${mm}`;
-        let label = `Bulan ${mm} ${yyyy}`;
-        options += `<option value="${val}">${label}</option>`;
-    }
-    sel.innerHTML = options;
-    sel.value = `${year}-${String(month).padStart(2, '0')}`;
-}
-
-function updateFilter() { renderAll(); }
-
-// --- DATA LOADING ---
-function loadData() {
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify({
-        action:'get_data',
-        role: user.role,
-        desa: user.desa,
-        kelompok: user.kelompok
-    })})
-    .then(r=>r.json())
+// ==========================================
+// DATA FETCHING
+// ==========================================
+function fetchConfig() {
+    securePost({ action: 'get_config' })
     .then(res => {
-        db = res;
-        renderAll();
+        if (res.status !== 'success') return alert(res.message);
+
+        configData = res.config.map(r => ({
+            cat_code: r.cat_code, cat_title: r.cat_title,
+            item_id: r.item_id, item_label: r.item_label,
+            tipe: r.tipe, allowed_groups: r.allowed_groups || "ALL",
+            is_split: r.is_split || false,
+            split_kel: r.split_kel || 0, split_desa: r.split_desa || 0, split_daerah: r.split_daerah || 0
+        }));
+
+        targetsData = res.targets || {};
+        fetchData();
+
+        if (user.role === 'Daerah') renderConfigTable();
     });
 }
 
-function getMyCategories() {
-    const myAkun = getUserAkun();
-    return db.kategori.filter(k => {
-        return k.akun === 'all' || k.akun === myAkun;
+function fetchData() {
+    securePost({ action: 'fetch_data' })
+    .then(res => {
+        if (res.status === 'success') {
+            allTransactions = res.data;
+            updateDesaFilterOptions();
+            renderDataTable();
+            renderRecapTable();
+        }
     });
 }
 
-// --- RENDER MONITORING ---
-function renderMonitoring() {
-    const grid = document.getElementById('monitor-grid');
-    grid.innerHTML = '';
-    
-    if (db.summary_balances && db.summary_balances.length > 0) {
-        db.summary_balances.forEach(item => {
-            grid.innerHTML += `
-            <div class="card mon">
-                <div class="card-label">${item.nama} <span style="font-weight:400; text-transform:none;">(${item.role})</span></div>
-                <div class="card-value">${formatRp(item.saldo)}</div>
-            </div>`;
-        });
-    } else {
-        grid.innerHTML = `<div style="grid-column: 1/-1; text-align:center; color:var(--text-light); font-size:0.8rem;">Tidak ada data anak/anak bawahan.</div>`;
+// ==========================================
+// UPLOAD EXCEL (KELOMPOK)
+// ==========================================
+
+// Step 1: Download Template
+async function downloadTemplate() {
+    if (!configData || configData.length === 0) {
+        return showToast("Config belum dimuat. Coba refresh halaman.");
     }
-}
 
-function renderAll() {
-    renderDashboard();
-    renderMonitoring(); 
-    renderDropdowns();
-    renderTransaksiTable();
-    renderTabunganTable();
-    renderKategoriList();
-    document.getElementById('tr-tanggal').valueAsDate = new Date();
-    document.getElementById('tb-tanggal').valueAsDate = new Date();
-}
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Input Data');
 
-function renderDashboard() {
-    const filterVal = document.getElementById('filter-bulan').value;
-    document.getElementById('lbl-periode').innerText = filterVal === 'all' ? 'Semua' : filterVal;
-
-    // 1. Hitung Data Utama (Total Berjalan)
-    let sMasukMain=0, sKeluarMain=0;
-    db.transaksi.forEach(t => {
-        const nom = parseFloat(t.nominal);
-        if (t.tipe === 'masuk') sMasukMain += nom;
-        else sKeluarMain += nom;
-    });
-
-    // --- TAMBAHAN: Hitung Saldo Tabungan Total ---
-    let sMasukTabungan=0, sKeluarTabungan=0;
-    db.tabungan.forEach(t => {
-        const nom = parseFloat(t.nominal);
-        if (t.tipe === 'masuk') sMasukTabungan += nom;
-        else sKeluarTabungan += nom;
-    });
-
-    document.getElementById('val-saldo-main').innerText = formatRp(sMasukMain - sKeluarMain);
-    document.getElementById('val-saldo-tabungan').innerText = formatRp(sMasukTabungan - sKeluarTabungan); // Update kartu tabungan
-    document.getElementById('val-masuk-main').innerText = formatRp(sMasukMain);
-    document.getElementById('val-keluar-main').innerText = formatRp(sKeluarMain);
-
-    // 2. Hitung Data Periode
-    let sMasukPer=0, sKeluarPer=0;
-    const dataPeriode = db.transaksi.filter(t => {
-        return filterVal === 'all' || t.tanggal.startsWith(filterVal);
-    });
-
-    dataPeriode.forEach(t => {
-        const nom = parseFloat(t.nominal);
-        if (t.tipe === 'masuk') sMasukPer += nom;
-        else sKeluarPer += nom;
-    });
-
-    document.getElementById('val-saldo-per').innerText = formatRp(sMasukPer - sKeluarPer);
-    document.getElementById('val-masuk-per').innerText = formatRp(sMasukPer);
-    document.getElementById('val-keluar-per').innerText = formatRp(sKeluarPer);
-}
-function renderDropdowns() {
-    const myCats = getMyCategories();
-    const selKas = document.getElementById('tr-kategori');
-    selKas.innerHTML = '<option value="">-- Pilih Kategori Kas --</option>';
-    myCats.filter(k => k.tipe === 'Kas').forEach(k => {
-        const label = k.akun === 'all' ? k.nama_kategori : `${k.nama_kategori}`;
-        selKas.innerHTML += `<option value="${k.id}">${label}</option>`;
-    });
-
-    const selTab = document.getElementById('tb-kategori');
-    selTab.innerHTML = '<option value="">-- Pilih Jenis Tabungan --</option>';
-    myCats.filter(k => k.tipe === 'Tabungan').forEach(k => {
-        const label = k.akun === 'all' ? k.nama_kategori : `${k.nama_kategori}`;
-        selTab.innerHTML += `<option value="${k.id}">${label}</option>`;
-    });
-}
-
-function simpanTransaksi() {
-    const payload = {
-        action: 'create_transaksi',
-        tanggal: document.getElementById('tr-tanggal').value,
-        tipe: document.getElementById('tr-tipe').value,
-        kategori_id: document.getElementById('tr-kategori').value,
-        nominal: parseRupiah(document.getElementById('tr-nominal').value),
-        keterangan: document.getElementById('tr-ket').value,
-        nama_admin: user.nama_admin,
-        role: user.role,
-        desa: user.desa,
-        kelompok: user.kelompok
+    // Header style
+    const headerFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3B82F6' } };
+    const headerFont = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+    const border = {
+        top: { style: 'thin' }, left: { style: 'thin' },
+        bottom: { style: 'thin' }, right: { style: 'thin' }
     };
-    if(!payload.kategori_id || !payload.nominal) return alert("Lengkapi data");
 
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify(payload) })
-    .then(r=>r.json()).then(res => {
-        if(res.status === 'success') { showToast('Transaksi Disimpan'); document.getElementById('tr-nominal').value=''; document.getElementById('tr-ket').value=''; loadData(); }
+    // Kolom A & B fixed
+    sheet.getColumn(1).width = 14;
+    sheet.getColumn(2).width = 30;
+
+    // Header row 1
+    const headers = ['Periode', 'Nama Warga'];
+    configData.forEach(c => headers.push(c.item_id));
+
+    const headerRow = sheet.addRow(headers);
+    headerRow.eachCell(cell => {
+        cell.font = headerFont;
+        cell.fill = headerFill;
+        cell.border = border;
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
     });
-}
+    headerRow.height = 25;
 
-function renderTransaksiTable() {
-    const tbody = document.querySelector('#table-transaksi tbody');
-    tbody.innerHTML = '';
-    const filterVal = document.getElementById('filter-bulan').value;
-    
-    const data = db.transaksi
-        .filter(t => filterVal === 'all' || t.tanggal.startsWith(filterVal))
-        .sort((a,b) => new Date(b.tanggal) - new Date(a.tanggal));
-
-    data.forEach(t => {
-        const isMasuk = t.tipe === 'masuk';
-        const kat = getMyCategories().find(k => k.id === t.kategori_id);
-        tbody.innerHTML += `<tr>
-            <td>${t.tanggal}</td>
-            <td><span class="badge ${isMasuk?'badge-kas':'badge-keluar'}" style="${!isMasuk?'background:#fee2e2;color:#991b1b':''}">${isMasuk?'+':'-'}</span></td>
-            <td>${kat ? kat.nama_kategori : '?'}</td>
-            <td>${t.keterangan}</td>
-            <td style="text-align:right; font-weight:bold; color:${isMasuk?'var(--success)':'var(--danger)'}">${formatRp(t.nominal)}</td>
-            <td><button class="btn btn-sm btn-danger" onclick="hapusTrans('${t.id}')"><i class="ph ph-trash"></i></button></td>
-        </tr>`;
+    // Baris contoh (contoh format periode)
+    const contohRow = ['2025-01', 'Contoh: Nama Warga (HAPUS baris ini)'];
+    configData.forEach(() => contohRow.push(0));
+    const r2 = sheet.addRow(contohRow);
+    r2.eachCell(cell => {
+        cell.font = { italic: true, color: { argb: 'FF999999' } };
+        cell.border = border;
     });
-}
 
-function hapusTrans(id) {
-    if(!confirm('Hapus?')) return;
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify({action:'delete_transaksi', id:id}) })
-    .then(r=>r.json()).then(res => { if(res.status==='success') loadData(); });
-}
-
-// --- TABUNGAN ---
-function simpanTabungan() {
-    const payload = {
-        action: 'create_tabungan',
-        tanggal: document.getElementById('tb-tanggal').value,
-        tipe: document.getElementById('tb-tipe').value,
-        kategori_id: document.getElementById('tb-kategori').value,
-        nominal: parseRupiah(document.getElementById('tb-nominal').value),
-        keterangan: document.getElementById('tb-ket').value, // TAMBAHAN KETERANGAN
-        nama_admin: user.nama_admin,
-        desa: user.desa,
-        kelompok: user.kelompok
-    };
-    if(!payload.kategori_id || !payload.nominal) return alert("Lengkapi data");
-
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify(payload) })
-    .then(r=>r.json()).then(res => { 
-        if(res.status==='success') { 
-            showToast('Tabungan Disimpan'); 
-            document.getElementById('tb-nominal').value=''; 
-            document.getElementById('tb-ket').value=''; // RESET KETERANGAN
-            loadData(); 
-        }
+    // Sheet referensi item
+    const refSheet = workbook.addWorksheet('Referensi Item');
+    const refHeader = refSheet.addRow(['Kategori', 'ID Item', 'Label Item', 'Tipe']);
+    refHeader.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = headerFill;
+        cell.border = border;
     });
-}
-
-function renderTabunganTable() {
-    const tbody = document.getElementById('tbody-tabungan');
-    tbody.innerHTML = '';
-    const data = db.tabungan.sort((a,b) => new Date(b.tanggal) - new Date(a.tanggal));
-    data.forEach(t => {
-        const isMasuk = t.tipe === 'masuk';
-        const kat = getMyCategories().find(k => k.id === t.kategori_id);
-        // UPDATE TABEL UNTUK MENAMPILKAN KETERANGAN
-        tbody.innerHTML += `<tr>
-            <td>${t.tanggal}</td>
-            <td><span class="badge ${isMasuk?'badge-kas':'badge-keluar'}" style="${!isMasuk?'background:#fee2e2;color:#991b1b':''}">${isMasuk?'Setor':'Tarik'}</span></td>
-            <td><span class="badge badge-tab">${kat ? kat.nama_kategori : '-'}</span></td>
-            <td>${t.keterangan || '-'}</td>
-            <td style="text-align:right; font-weight:bold; color:${isMasuk?'var(--success)':'var(--danger)'}">${formatRp(t.nominal)}</td>
-            <td><button class="btn btn-sm btn-danger" onclick="hapusTrans('${t.id}')"><i class="ph ph-trash"></i></button></td>
-        </tr>`;
+    configData.forEach(c => {
+        const r = refSheet.addRow([c.cat_title, c.item_id, c.item_label, c.tipe]);
+        r.eachCell(cell => cell.border = border);
     });
-}
+    refSheet.getColumn(1).width = 25;
+    refSheet.getColumn(2).width = 18;
+    refSheet.getColumn(3).width = 35;
+    refSheet.getColumn(4).width = 12;
 
-// --- KATEGORI ---
-function switchTab(tab) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    event.currentTarget.classList.add('active');
-    document.querySelectorAll('.view-section').forEach(s => s.classList.add('hidden'));
-    document.getElementById('view-'+tab).classList.remove('hidden');
-}
+    // Freeze header
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
 
-function addKategori() {
-    const nama = document.getElementById('kat-nama').value;
-    const tipe = document.getElementById('kat-tipe').value;
-    if(!nama) return alert('Isi nama kategori');
-    const myAkun = getUserAkun();
-    const payload = {
-        action: 'create_kategori', nama_kategori: nama, tipe: tipe, akun: myAkun, nama_admin: user.nama_admin
-    };
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify(payload) })
-    .then(r=>r.json()).then(res => {
-        if(res.status==='success') {
-            document.getElementById('kat-nama').value = '';
-            showToast('Kategori Ditambahkan');
-            loadData();
-        }
-    });
-}
+    // Note di bawah
+    const noteRow = sheet.addRow([]);
+    sheet.addRow(['CATATAN:']);
+    sheet.addRow(['- Format Periode: YYYY-MM (contoh: 2025-01)']);
+    sheet.addRow(['- Isi kolom item sesuai nominal (tanpa titik/koma, contoh: 50000)']);
+    sheet.addRow(['- Baris contoh di atas mohon dihapus sebelum upload']);
+    sheet.addRow(['- Jangan mengubah nama header kolom']);
 
-function renderKategoriList() {
-    const div = document.getElementById('list-kategori');
-    div.innerHTML = '';
-    const myCats = getMyCategories();
-    if(myCats.length === 0) {
-        div.innerHTML = `<div style="grid-column: 1/-1; text-align:center; padding: 2rem; color:var(--text-light); background:#f1f5f9; border-radius:8px;">
-            <i class="ph ph-tag" style="font-size:2rem; margin-bottom:0.5rem;"></i><br>
-            Belum ada kategori.
-        </div>`;
-        return;
-    }
-    myCats.forEach(k => {
-        const isGlobal = k.akun === 'all';
-        div.innerHTML += `<div style="background:#f8fafc; border:1px solid var(--border); padding:10px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;">
-            <div>
-                <div style="font-weight:600; font-size:0.9rem;">${k.nama_kategori}</div>
-                <div style="font-size:0.75rem; color:var(--text-light);">${k.tipe} • ${isGlobal ? '<b>Global</b>' : 'Sendiri'}</div>
-            </div>
-            ${!isGlobal ? `<button class="btn btn-sm btn-danger" onclick="hapusKat('${k.id}')"><i class="ph ph-trash"></i></button>` : ''}
-        </div>`;
-    });
-}
-
-function hapusKat(id) {
-    if(!confirm("Hapus?")) return;
-    fetch(SCRIPT_URL, { method:'POST', body:JSON.stringify({ action:'delete_kategori', id:id}) })
-    .then(r=>r.json()).then(res => { if(res.status==='success') loadData(); });
-}
-
-// --- DOWNLOAD EXCEL ---
-async function downloadExcel(tipe) {
-    const wb = new ExcelJS.Workbook();
-    const namaAkun = getUserAkun();
-    const filterVal = document.getElementById('filter-bulan').value;
-
-    let judulSheet = '';
-    if (tipe === 'buku') judulSheet = 'Buku Kas';
-    if (tipe === 'laporan') judulSheet = 'Laporan Kas';
-    if (tipe === 'laporan-tabungan') judulSheet = 'Laporan Tabungan';
-
-    // ================= SALDO AWAL =================
-    let saldoAwal = 0;
-    if (tipe === 'laporan' && filterVal !== 'all') {
-        db.transaksi.forEach(t => {
-            if (t.tanggal < filterVal) {
-                const n = Number(t.nominal);
-                saldoAwal += (t.tipe === 'masuk') ? n : -n;
-            }
-        });
-    }
-
-    const ws = wb.addWorksheet(judulSheet);
-
-    // ================= HELPER =================
-    function styleTitle(row, colEnd, text) {
-        ws.mergeCells(`A${row}:${colEnd}${row}`);
-        const c = ws.getCell(`A${row}`);
-        c.value = text;
-        c.font = { bold: true, size: 14 };
-        c.alignment = { horizontal: 'center', vertical: 'middle' };
-    }
-
-    function styleSubTitle(row, colEnd, text) {
-        ws.mergeCells(`A${row}:${colEnd}${row}`);
-        const c = ws.getCell(`A${row}`);
-        c.value = text;
-        c.font = { italic: true, size: 10 };
-        c.alignment = { horizontal: 'center' };
-    }
-
-    function styleBorder(row, colStart, colEnd) {
-        for (let col = colStart; col <= colEnd; col++) {
-            ws.getRow(row).getCell(col).border = {
-                top: { style: 'thin' },
-                left: { style: 'thin' },
-                bottom: { style: 'thin' },
-                right: { style: 'thin' }
-            };
-        }
-    }
-
-    // =====================================================
-    // ================= LAPORAN KAS =======================
-    // =====================================================
-    if (tipe === 'laporan') {
-        const dataScope = db.transaksi.filter(
-            t => filterVal === 'all' || t.tanggal.startsWith(filterVal)
-        );
-
-        styleTitle(1, 'B', 'LAPORAN PENERIMAAN DAN PENGELUARAN KAS');
-        styleSubTitle(2, 'B', `Kelompok : ${namaAkun}`);
-        styleSubTitle(3, 'B', `Periode  : ${filterVal === 'all' ? 'Semua' : filterVal}`);
-
-        let r = 5;
-
-        ws.addRow(['SALDO AWAL', saldoAwal]);
-        ws.getRow(r).font = { bold: true };
-        ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-        ws.getCell(`B${r}`).alignment = { horizontal: 'right' };
-        ws.getCell(`B${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFE2E8F0'}
-        };
-        styleBorder(r,1,2);
-
-        let totalMasuk = 0;
-        let totalKeluar = 0;
-
-        // ----- PENERIMAAN -----
-        r += 2;
-        ws.addRow(['PENERIMAAN', 'NOMINAL']);
-        ws.getRow(r).font = { bold: true };
-        ws.getCell(`A${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FF10B981'}
-        };
-        ws.getCell(`B${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FF10B981'}
-        };
-        ws.getRow(r).alignment = { horizontal: 'center' };
-        styleBorder(r,1,2);
-
-        const inc = {};
-        dataScope.filter(t => t.tipe === 'masuk').forEach(t => {
-            const kat = getMyCategories().find(k => k.id === t.kategori_id);
-            const nama = kat ? kat.nama_kategori : 'Lain-lain';
-            inc[nama] = (inc[nama] || 0) + Number(t.nominal);
-        });
-
-        for (const k in inc) {
-            r++;
-            ws.addRow([k, inc[k]]);
-            ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-            totalMasuk += inc[k];
-            styleBorder(r, 1, 2);
-        }
-
-        r++;
-        ws.addRow(['JUMLAH PENERIMAAN', totalMasuk]);
-        ws.getRow(r).font = { bold: true };
-
-        ws.getCell(`A${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFD1FAE5'}
-        };
-        ws.getCell(`B${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFD1FAE5'}
-        };
-
-        ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-        ws.getCell(`B${r}`).alignment = { horizontal: 'right' };
-        styleBorder(r,1,2);
-
-        // ----- PENGELUARAN -----
-        r += 2;
-        ws.addRow(['PENGELUARAN', 'NOMINAL']);
-        ws.getRow(r).font = { bold: true };
-        ws.getRow(r).alignment = { horizontal: 'center' };
-        styleBorder(r, 1, 2);
-
-        const exp = {};
-        dataScope.filter(t => t.tipe === 'keluar').forEach(t => {
-            const kat = getMyCategories().find(k => k.id === t.kategori_id);
-            const nama = kat ? kat.nama_kategori : 'Lain-lain';
-            exp[nama] = (exp[nama] || 0) + Number(t.nominal);
-        });
-
-        for (const k in exp) {
-            r++;
-            ws.addRow([k, exp[k]]);
-            ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-            totalKeluar += exp[k];
-            styleBorder(r, 1, 2);
-        }
-
-        r++;
-        ws.addRow(['JUMLAH PENGELUARAN', totalKeluar]);
-        ws.getRow(r).font = { bold: true };
-
-        ws.getCell(`A${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFFEE2E2'}
-        };
-        ws.getCell(`B${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFFEE2E2'}
-        };
-
-        ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-        ws.getCell(`B${r}`).alignment = { horizontal: 'right' };
-        styleBorder(r,1,2);
-
-        // ----- SALDO AKHIR -----
-        ws.addRow(['SALDO AKHIR', saldoAwal + totalMasuk - totalKeluar]);
-        ws.getRow(r).font = { bold: true };
-        ws.getCell(`B${r}`).numFmt = '"Rp "#,##0';
-        ws.getCell(`B${r}`).alignment = { horizontal: 'right' };
-        ws.getCell(`B${r}`).fill = {
-            type:'pattern', pattern:'solid', fgColor:{argb:'FFDBEAFE'}
-        };
-        styleBorder(r,1,2);
-
-        ws.getColumn(1).width = 32;
-        ws.getColumn(2).width = 20;
-        ws.getColumn(2).alignment = { horizontal: 'right' };
-    }
-
-    // =====================================================
-    // ================= BUKU KAS ==========================
-    // =====================================================
-    else if (tipe === 'buku') {
-        const dataScope = db.transaksi
-            .filter(t => filterVal === 'all' || t.tanggal.startsWith(filterVal))
-            .sort((a,b) => new Date(a.tanggal) - new Date(b.tanggal));
-
-        styleTitle(1, 'G', 'BUKU KAS UMUM');
-        styleSubTitle(2, 'G', `Kelompok : ${namaAkun} | Periode : ${filterVal}`);
-
-        ws.addRow(['NO','TANGGAL','URAIAN','KATEGORI','MASUK','KELUAR','SALDO']);
-        const hr = ws.getRow(3);
-
-        for (let c=1;c<=7;c++) {
-            const cell = hr.getCell(c);
-            cell.font = { bold:true, color:{argb:'FFFFFFFF'} };
-            cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FF1F2937'} };
-            cell.alignment = { horizontal:'center' };
-            cell.border = { top:{style:'thin'}, left:{style:'thin'}, bottom:{style:'thin'}, right:{style:'thin'} };
-        }
-
-        let r = 3;
-
-        // ===== HITUNG SALDO AWAL =====
-        let saldoAwal = 0;
-        if (filterVal !== 'all') {
-            db.transaksi.forEach(t => {
-                if (t.tanggal < filterVal) {
-                    const n = Number(t.nominal);
-                    saldoAwal += (t.tipe === 'masuk') ? n : -n;
-                }
-            });
-        }
-
-        let saldo = saldoAwal;
-        let no = 1;
-
-        // ===== TAMPILKAN SALDO AWAL =====
-        if (saldoAwal !== 0) {
-            r++;
-            ws.addRow(['','', 'Saldo Awal Periode','', '', '', saldoAwal]);
-            ws.getCell(`G${r}`).numFmt = '"Rp "#,##0';
-            ws.getRow(r).font = { italic:true };
-            styleBorder(r,1,7);
-        }
-
-        // ===== DAFTAR TRANSAKSI =====
-        dataScope.forEach(t => {
-            r++;
-            const n = Number(t.nominal);
-            const masuk = t.tipe === 'masuk';
-            saldo = masuk ? saldo + n : saldo - n;
-
-            ws.addRow([
-                no++,
-                t.tanggal,
-                t.keterangan,
-                getMyCategories().find(k=>k.id===t.kategori_id)?.nama_kategori || '-',
-                masuk ? n : '',
-                !masuk ? n : '',
-                saldo
-            ]);
-
-            ws.getCell(`E${r}`).numFmt = '"Rp "#,##0';
-            ws.getCell(`F${r}`).numFmt = '"Rp "#,##0';
-            ws.getCell(`G${r}`).numFmt = '"Rp "#,##0';
-            styleBorder(r,1,7);
-        });
-
-        ws.columns = [
-            { width:5 }, { width:11 }, { width:26 },
-            { width:18 }, { width:14 }, { width:14 }, { width:16 }
-        ];
-    }
-
-    // =====================================================
-    // ================= TABUNGAN (PER KATEGORI) ============
-    // =====================================================
-    else if (tipe === 'laporan-tabungan') {
-        styleTitle(1, 'E', 'LAPORAN TABUNGAN PER KATEGORI');
-        styleSubTitle(2, 'E', `Kelompok : ${namaAkun} | Periode : ${filterVal === 'all' ? 'Semua' : filterVal}`);
-
-        // 1. Kelompokkan Data berdasarkan Kategori
-        const groupedData = {};
-        db.tabungan.forEach(t => {
-            const catId = t.kategori_id;
-            if (!groupedData[catId]) groupedData[catId] = [];
-            groupedData[catId].push(t);
-        });
-
-        let currentRow = 4; // Mulai menulis data dari baris ke-4
-
-        // 2. Loop setiap kategori dan buat tabelnya
-        Object.keys(groupedData).forEach(catId => {
-            const kategori = getMyCategories().find(k => k.id === catId);
-            const namaKategori = kategori ? kategori.nama_kategori : 'Tanpa Kategori';
-            const transaksi = groupedData[catId].sort((a,b) => new Date(a.tanggal) - new Date(b.tanggal));
-
-            // --- Header Kategori ---
-            ws.addRow([`KATEGORI: ${namaKategori}`]);
-            const headerRow = ws.getRow(currentRow);
-            headerRow.font = { bold: true, size: 12, color: { argb:'FF7C3AED' } };
-            headerRow.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FFF3E8FF'} };
-            ws.mergeCells(`A${currentRow}:E${currentRow}`);
-            currentRow++;
-
-            // --- Header Tabel ---
-            ws.addRow(['TANGGAL','KETERANGAN','MASUK (+)','KELUAR (-)','SALDO']);
-            const tableHeader = ws.getRow(currentRow);
-            for (let c=1;c<=5;c++) {
-                const cell = tableHeader.getCell(c);
-                cell.font = { bold:true, color:{argb:'FFFFFFFF'} };
-                cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FF7C3AED'} };
-                cell.alignment = { horizontal:'center' };
-                cell.border = { top:{style:'thin'}, left:{style:'thin'}, bottom:{style:'thin'}, right:{style:'thin'} };
-            }
-            currentRow++;
-
-            // --- Isi Data Transaksi ---
-            let saldoKategori = 0;
-            transaksi.forEach(t => {
-                const n = Number(t.nominal);
-                const ket = t.keterangan || (kategori ? kategori.nama_kategori : '-');
-                saldoKategori = t.tipe === 'masuk' ? saldoKategori + n : saldoKategori - n;
-
-                ws.addRow([
-                    t.tanggal,
-                    ket,
-                    t.tipe === 'masuk' ? n : '',
-                    t.tipe === 'keluar' ? n : '',
-                    saldoKategori
-                ]);
-
-                const dataRow = ws.getRow(currentRow);
-                ws.getCell(`C${currentRow}`).numFmt = '"Rp "#,##0';
-                ws.getCell(`D${currentRow}`).numFmt = '"Rp "#,##0';
-                ws.getCell(`E${currentRow}`).numFmt = '"Rp "#,##0';
-                
-                // Border sel
-                for (let c=1;c<=5;c++) {
-                    dataRow.getCell(c).border = { top:{style:'thin'}, left:{style:'thin'}, bottom:{style:'thin'}, right:{style:'thin'} };
-                }
-                currentRow++;
-            });
-
-            // --- Total Kategori ---
-            ws.addRow(['', 'SALDO AKHIR ' + namaKategori.toUpperCase(), '', '', saldoKategori]);
-            const totalRow = ws.getRow(currentRow);
-            totalRow.font = { bold: true };
-            ws.getCell(`E${currentRow}`).fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FFD1FAE5'} };
-            ws.getCell(`E${currentRow}`).numFmt = '"Rp "#,##0';
-            ws.getCell(`E${currentRow}`).alignment = { horizontal: 'right' };
-            for (let c=1;c<=5;c++) {
-                totalRow.getCell(c).border = { top:{style:'thin'}, left:{style:'thin'}, bottom:{style:'thin'}, right:{style:'thin'} };
-            }
-            
-            currentRow += 2; // Beri jarak antar kategori
-        });
-
-        ws.columns = [
-            { width:12 }, { width:35 }, { width:14 }, { width:14 }, { width:18 }
-        ];
-    }
-    // ================= SAVE FILE =================
-    const buffer = await wb.xlsx.writeBuffer();
+    // Generate & download
+    const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     });
-
-    const url = window.URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${judulSheet}_${namaAkun}_${filterVal !== 'all' ? filterVal : 'All'}_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.download = `Template_Input_${(user.kelompok || 'Kelompok').replace(/\s+/g, '_')}_${new Date().toISOString().slice(0, 7)}.xlsx`;
     a.click();
+    URL.revokeObjectURL(url);
+    showToast("✅ Template berhasil didownload!");
+}
+
+// Step 2: Handle File Upload
+async function handleFileUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.name.match(/\.(xlsx|xls)$/i)) {
+        showToast("Format file harus .xlsx atau .xls");
+        return;
+    }
+
+    try {
+        showToast("Membaca file...");
+        const workbook = new ExcelJS.Workbook();
+        const buffer = await file.arrayBuffer();
+        await workbook.xlsx.load(buffer);
+
+        const sheet = workbook.getWorksheet('Input Data') || workbook.worksheets[0];
+        if (!sheet) throw new Error("Sheet tidak ditemukan");
+
+        // Baca header
+        const headers = [];
+        const headerRow = sheet.getRow(1);
+        headerRow.eachCell((cell, colNumber) => {
+            headers[colNumber] = String(cell.value || '').trim();
+        });
+
+        // Validasi header dasar
+        if (headers[1] !== 'Periode' || headers[2] !== 'Nama Warga') {
+            throw new Error("Format header tidak sesuai template! Kolom A=Periode, B=Nama Warga");
+        }
+
+        // Kumpulkan item_id valid
+        const validItemIds = configData.map(c => c.item_id);
+
+        const rows = [];
+        sheet.eachRow((row, rowNumber) => {
+            if (rowNumber === 1) return; // skip header
+
+            const periode = String(row.getCell(1).value || '').trim();
+            const nama = String(row.getCell(2).value || '').trim();
+
+            // Skip baris kosong atau contoh
+            if (!periode || !nama) return;
+            if (nama.toLowerCase().includes('contoh') || nama.toLowerCase().includes('hapus')) return;
+            if (!/^\d{4}-\d{2}$/.test(periode)) {
+                console.warn(`Baris ${rowNumber}: format periode tidak valid: ${periode}`);
+                return;
+            }
+
+            const rowData = { periode, nama_warga: nama, values: {} };
+
+            for (let col = 3; col <= headers.length; col++) {
+                const itemId = headers[col];
+                if (!itemId || !validItemIds.includes(itemId)) continue;
+
+                const cellVal = row.getCell(col).value;
+                let nominal = 0;
+                if (typeof cellVal === 'number') nominal = cellVal;
+                else if (typeof cellVal === 'string') nominal = parseRupiah(cellVal);
+                else if (cellVal && typeof cellVal === 'object' && cellVal.result !== undefined) {
+                    nominal = parseFloat(cellVal.result) || 0;
+                }
+
+                if (nominal > 0) rowData.values[itemId] = nominal;
+            }
+
+            // Hanya ambil baris yang minimal 1 nilai
+            if (Object.keys(rowData.values).length > 0) {
+                rows.push(rowData);
+            }
+        });
+
+        if (rows.length === 0) {
+            throw new Error("Tidak ada data valid yang ditemukan. Periksa format file Anda.");
+        }
+
+        parsedExcelData = rows;
+        renderPreview(rows);
+        showToast(`✅ ${rows.length} baris berhasil dibaca`);
+
+    } catch (err) {
+        console.error(err);
+        showToast("❌ " + err.message);
+        resetUpload();
+    }
+}
+
+// Step 3: Preview
+function renderPreview(rows) {
+    const container = document.getElementById('preview-container');
+    const allItemIds = [...new Set(rows.flatMap(r => Object.keys(r.values)))];
+
+    let html = '<table style="min-width:auto; margin:0; font-size:0.75rem;">';
+    html += '<thead style="position:sticky; top:0; background:#f1f5f9; z-index:10;"><tr>';
+    html += '<th style="padding:8px;">Periode</th><th style="padding:8px;">Nama</th>';
+    allItemIds.forEach(id => html += `<th style="padding:8px; font-size:0.7rem;">${id}</th>`);
+    html += '<th style="padding:8px;">Total</th></tr></thead><tbody>';
+
+    let grandTotal = 0;
+    rows.forEach(r => {
+        const total = Object.values(r.values).reduce((a, b) => a + b, 0);
+        grandTotal += total;
+        html += '<tr>';
+        html += `<td style="padding:6px 8px;">${r.periode}</td>`;
+        html += `<td style="padding:6px 8px;">${r.nama_warga}</td>`;
+        allItemIds.forEach(id => {
+            const val = r.values[id] || 0;
+            html += `<td style="padding:6px 8px; text-align:right;">${val ? val.toLocaleString('id-ID') : '-'}</td>`;
+        });
+        html += `<td style="padding:6px 8px; text-align:right; font-weight:bold; color:var(--accent);">${total.toLocaleString('id-ID')}</td>`;
+        html += '</tr>';
+    });
+
+    html += `<tr style="background:#f8fafc; font-weight:bold;">`;
+    html += `<td colspan="${2 + allItemIds.length}" style="padding:8px; text-align:right;">TOTAL KESELURUHAN:</td>`;
+    html += `<td style="padding:8px; text-align:right; color:var(--success);">${grandTotal.toLocaleString('id-ID')}</td>`;
+    html += '</tr></tbody></table>';
+
+    container.innerHTML = html;
+    document.getElementById('preview-count').innerText = rows.length;
+    document.getElementById('upload-preview').style.display = 'flex';
+}
+
+// Step 4: Confirm & Save
+async function confirmUpload(event) {
+    if (!parsedExcelData || parsedExcelData.length === 0) {
+        return showToast("Tidak ada data untuk disimpan");
+    }
+
+    const btn = event.target;
+    const originalHTML = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="ph ph-spinner"></i> Menyimpan...';
+
+    try {
+        const res = await securePost({
+            action: 'batch_create',
+            data: parsedExcelData
+        });
+
+        if (res.status === 'success') {
+            showToast(`✅ ${res.saved} data berhasil disimpan!`);
+            resetUpload();
+            fetchData();
+            setTimeout(() => switchTab('data'), 800);
+        } else {
+            throw new Error(res.message);
+        }
+    } catch (err) {
+        showToast("❌ " + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalHTML;
+    }
+}
+
+function resetUpload() {
+    parsedExcelData = null;
+    const input = document.getElementById('excel-upload');
+    if (input) input.value = '';
+    document.getElementById('upload-preview').style.display = 'none';
+}
+
+// ==========================================
+// DATA TABLE
+// ==========================================
+function renderDataTable() {
+    const tbody = document.getElementById('table-body-data');
+    const filterPeriode = document.getElementById('filter-data-periode').value;
+    const filterDesa = document.getElementById('filter-data-desa').value;
+
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    let grandTotal = 0;
+
+    const filtered = allTransactions.filter(t => {
+        let match = true;
+        if (user.role === 'Kelompok') match = t.kelompok === user.kelompok;
+        else if (user.role === 'Desa') match = t.desa === user.desa;
+        if (match && filterPeriode) match = (t.periode && String(t.periode).trim() === filterPeriode);
+        if (match && user.role === 'Daerah' && filterDesa) match = (t.desa && String(t.desa).trim() === filterDesa);
+        return match;
+    });
+
+    filtered.reverse().forEach(t => {
+        let valObj = {};
+        try { valObj = JSON.parse(t.values_json); } catch (e) { }
+        const total = Object.values(valObj).reduce((a, b) => a + (parseFloat(b) || 0), 0);
+        grandTotal += total;
+
+        const displayDate = t.timestamp ? String(t.timestamp).split(' ')[0] : '-';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${displayDate}</td>
+            <td>${t.periode}</td>
+            <td>${t.nama_warga}</td>
+            <td>${t.desa || t.kelompok || '-'}</td>
+            <td style="font-weight:bold; color:var(--accent)">Rp ${total.toLocaleString('id-ID')}</td>
+            <td>
+                <button class="btn btn-sm btn-danger" onclick="deleteData('${t.id}')"><i class="ph ph-trash"></i></button>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    const grandTotalEl = document.getElementById('grand-total-data');
+    if (grandTotalEl) grandTotalEl.innerText = `Rp ${grandTotal.toLocaleString('id-ID')}`;
+}
+
+// ==========================================
+// REKAP TABLE
+// ==========================================
+function renderRecapTable() {
+    const tbody = document.getElementById('table-body-rekap');
+    const filterPeriodeRaw = document.getElementById('filter-rekap-periode').value;
+    const filterDesa = document.getElementById('filter-rekap-desa').value;
+
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (!filterPeriodeRaw) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:2rem; color:var(--text-light);">Silakan pilih periode terlebih dahulu.</td></tr>';
+        const footer = document.getElementById('grand-total-rekap');
+        if (footer) footer.innerText = "Rp 0";
+        return;
+    }
+
+    const [selectedYear, selectedMonthStr] = filterPeriodeRaw.split('-');
+    const selectedMonth = parseInt(selectedMonthStr);
+
+    let targetIdentity;
+    if (user.role === 'Kelompok') targetIdentity = user.kelompok;
+    else if (user.role === 'Desa') targetIdentity = user.desa;
+    else if (user.role === 'Daerah') targetIdentity = filterDesa || "Daerah";
+    else targetIdentity = "";
+
+    const currentTargets = targetsData[targetIdentity] || {};
+    const realisasiBlnIni = {};
+    const akumulasiYTD = {};
+    let grandTotalBlnIni = 0;
+
+    allTransactions.forEach(t => {
+        const tPeriode = String(t.periode).trim();
+        const [tYear, tMonthStr] = tPeriode.split('-');
+        const tMonth = parseInt(tMonthStr);
+
+        let matchUser = true;
+        if (user.role === 'Kelompok') matchUser = t.kelompok === user.kelompok;
+        else if (user.role === 'Desa') matchUser = t.desa === user.desa;
+        if (matchUser && user.role === 'Daerah' && filterDesa) matchUser = t.desa === filterDesa;
+
+        if (matchUser && tYear === selectedYear) {
+            let valObj = {};
+            try { valObj = JSON.parse(t.values_json); } catch (e) { }
+            for (let [key, val] of Object.entries(valObj)) {
+                const nominal = parseFloat(val) || 0;
+                akumulasiYTD[key] = (akumulasiYTD[key] || 0) + nominal;
+                if (tMonth === selectedMonth) {
+                    realisasiBlnIni[key] = (realisasiBlnIni[key] || 0) + nominal;
+                    grandTotalBlnIni += nominal;
+                }
+            }
+        }
+    });
+
+    configData.forEach(conf => {
+        const id = conf.item_id;
+        const bln = realisasiBlnIni[id] || 0;
+        const ytd = akumulasiYTD[id] || 0;
+        const tipe = (conf.tipe || "Tahunan").trim();
+        const targetVal = parseFloat(currentTargets[id]) || 0;
+
+        let persen = 0;
+        const labelTarget = tipe === "Bulanan" ? "Target/Bln" : "Target/Thn";
+
+        if (tipe === "Bulanan") persen = targetVal > 0 ? Math.round((bln / targetVal) * 100) : 0;
+        else persen = targetVal > 0 ? Math.round((ytd / targetVal) * 100) : 0;
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>
+                <div style="font-weight:600; font-size:0.85rem;">${conf.item_label}</div>
+                <div style="font-size:0.6rem; color:#fff; background:${tipe === 'Bulanan' ? '#8b5cf6' : '#3b82f6'}; padding:1px 6px; border-radius:10px; display:inline-block; margin-top:2px;">
+                    ${tipe}
+                </div>
+            </td>
+            <td style="text-align:right; font-weight:700; color:var(--accent);">
+                Rp ${bln.toLocaleString('id-ID')}
+            </td>
+            <td style="text-align:right; font-size:0.8rem; color:var(--text-light);">
+                ${tipe === 'Bulanan' ? '-' : 'Rp ' + ytd.toLocaleString('id-ID')}
+            </td>
+            <td style="text-align:right;">
+                <div style="font-size:0.8rem; font-weight:600;">Rp ${targetVal.toLocaleString('id-ID')}</div>
+                <div style="font-size:0.55rem; color:var(--text-light); text-transform:uppercase;">${labelTarget}</div>
+            </td>
+            <td>
+                <div style="font-size:0.7rem; margin-bottom:3px; display:flex; justify-content:space-between;">
+                    <span style="font-weight:bold">${persen}%</span>
+                    <span style="font-size:0.6rem; opacity:0.7">${tipe === 'Tahunan' ? 'YTD' : 'REAL'}</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar" style="width: ${persen > 100 ? 100 : persen}%; background: ${persen >= 100 ? '#22c55e' : (tipe === 'Bulanan' ? '#a78bfa' : '#3b82f6')};"></div>
+                </div>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    const footer = document.getElementById('grand-total-rekap');
+    if (footer) footer.innerText = `Rp ${grandTotalBlnIni.toLocaleString('id-ID')}`;
+}
+
+// ==========================================
+// CONFIG TABLE
+// ==========================================
+function renderConfigTable() {
+    const tbody = document.getElementById('table-body-config');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    configData.forEach(item => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><b>${item.item_id}</b></td>
+            <td>${item.cat_title}</td>
+            <td>${item.item_label}</td>
+            <td><span style="font-size:0.75rem; background:${item.tipe === 'Bulanan' ? '#a78bfa' : '#3b82f6'}; color:white; padding:2px 6px; border-radius:4px;">${item.tipe}</span></td>
+            <td>${item.allowed_groups || "ALL"}</td>
+            <td>
+                <button class="btn btn-sm" onclick="editConfig('${item.item_id}')"><i class="ph ph-pencil-simple"></i></button>
+                <button class="btn btn-sm btn-danger" onclick="deleteConfig('${item.item_id}')"><i class="ph ph-trash"></i></button>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+function openConfigModal(isEdit = false) {
+    document.getElementById('config-modal').style.display = 'flex';
+    document.getElementById('modal-title-config').innerText = isEdit ? "Edit Item Config" : "Tambah Item Config";
+
+    if (!isEdit) {
+        ['cfg-old-id', 'cfg-item-id', 'cfg-cat-code', 'cfg-cat-title', 'cfg-item-label', 'cfg-groups']
+            .forEach(id => document.getElementById(id).value = '');
+        document.getElementById('cfg-tipe').value = 'Bulanan';
+        document.getElementById('cfg-is-split').checked = false;
+        document.getElementById('split-inputs').style.display = 'none';
+        ['cfg-split-kel', 'cfg-split-desa', 'cfg-split-dah'].forEach(id => document.getElementById(id).value = 0);
+    }
+}
+
+function closeConfigModal() {
+    document.getElementById('config-modal').style.display = 'none';
+}
+
+function editConfig(id) {
+    const item = configData.find(x => x.item_id === id);
+    if (!item) return alert("Data tidak ditemukan!");
+
+    document.getElementById('cfg-old-id').value = item.item_id;
+    document.getElementById('cfg-item-id').value = item.item_id;
+    document.getElementById('cfg-cat-code').value = item.cat_code || '';
+    document.getElementById('cfg-cat-title').value = item.cat_title || '';
+    document.getElementById('cfg-item-label').value = item.item_label || '';
+    document.getElementById('cfg-tipe').value = item.tipe || 'Bulanan';
+    document.getElementById('cfg-groups').value = item.allowed_groups || '';
+
+    const isSplit = item.is_split || false;
+    document.getElementById('cfg-is-split').checked = isSplit;
+    document.getElementById('split-inputs').style.display = isSplit ? 'grid' : 'none';
+    document.getElementById('cfg-split-kel').value = item.split_kel || 0;
+    document.getElementById('cfg-split-desa').value = item.split_desa || 0;
+    document.getElementById('cfg-split-dah').value = item.split_daerah || 0;
+
+    openConfigModal(true);
+}
+
+function saveConfig() {
+    const oldId = document.getElementById('cfg-old-id').value.trim();
+    const itemId = document.getElementById('cfg-item-id').value.trim();
+    const catCode = document.getElementById('cfg-cat-code').value.trim();
+    const catTitle = document.getElementById('cfg-cat-title').value.trim();
+    const itemLabel = document.getElementById('cfg-item-label').value.trim();
+    const tipe = document.getElementById('cfg-tipe').value;
+    const groups = document.getElementById('cfg-groups').value.trim();
+
+    const isSplit = document.getElementById('cfg-is-split').checked;
+    const splitKel = parseFloat(document.getElementById('cfg-split-kel').value) || 0;
+    const splitDesa = parseFloat(document.getElementById('cfg-split-desa').value) || 0;
+    const splitDah = parseFloat(document.getElementById('cfg-split-dah').value) || 0;
+
+    if (!itemId || !catCode || !catTitle || !itemLabel) {
+        return showToast("Lengkapi data wajib!");
+    }
+    if (isSplit && (splitKel + splitDesa + splitDah !== 100)) {
+        return showToast("Total persentase split harus 100%!");
+    }
+
+    const payload = {
+        action: oldId ? 'update_config' : 'create_config',
+        old_id: oldId, item_id: itemId,
+        cat_code: catCode, cat_title: catTitle, item_label: itemLabel,
+        tipe: tipe, allowed_groups: groups || "ALL",
+        is_split: isSplit, split_kel: splitKel, split_desa: splitDesa, split_daerah: splitDah
+    };
+
+    securePost(payload)
+    .then(res => {
+        if (res.status === 'success') {
+            showToast("✅ Config disimpan!");
+            closeConfigModal();
+            fetchConfig();
+        } else {
+            showToast("Error: " + res.message);
+        }
+    });
+}
+
+function deleteConfig(id) {
+    if (!confirm("Hapus item ini?")) return;
+    securePost({ action: 'delete_config', item_id: id }).then(res => {
+        if (res.status === 'success') fetchConfig();
+    });
+}
+
+document.getElementById('cfg-is-split').addEventListener('change', function () {
+    document.getElementById('split-inputs').style.display = this.checked ? 'grid' : 'none';
+});
+
+// ==========================================
+// TARGETS
+// ==========================================
+function renderTargetsTable() {
+    const thead = document.getElementById('thead-targets');
+    const tbody = document.getElementById('tbody-targets');
+    if (!thead || !tbody) return;
+
+    thead.innerHTML = '';
+    tbody.innerHTML = '';
+
+    if (!targetsData || Object.keys(targetsData).length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding:2rem;">Belum ada data Target.</td></tr>';
+        return;
+    }
+
+    const itemsList = configData.map(c => c.item_id);
+
+    let headerHTML = '<tr><th style="position:sticky; left:0; background:#f8fafc; z-index:10;">Identitas</th>';
+    itemsList.forEach(itemId => {
+        const itemConf = configData.find(c => c.item_id === itemId);
+        const label = itemConf ? itemConf.item_label : itemId;
+        headerHTML += `<th style="min-width:120px; text-align:center; font-size:0.75rem;">${label}</th>`;
+    });
+    headerHTML += '</tr>';
+    thead.innerHTML = headerHTML;
+
+    Object.keys(targetsData).forEach(identity => {
+        const tr = document.createElement('tr');
+        let rowHTML = `<td style="font-weight:bold; position:sticky; left:0; background:white; z-index:5; border-right:2px solid #ddd;">${identity}</td>`;
+        const dataRow = targetsData[identity];
+
+        itemsList.forEach(itemId => {
+            const val = dataRow[itemId] || 0;
+            rowHTML += `
+                <td style="text-align:center;">
+                    <input type="number" class="target-input" value="${val}"
+                           style="width:100px; text-align:center; padding:5px; border:1px solid #ddd; border-radius:4px;"
+                           onblur="updateTarget(this, '${identity}', '${itemId}')">
+                </td>
+            `;
+        });
+
+        tr.innerHTML = rowHTML;
+        tbody.appendChild(tr);
+    });
+}
+
+function updateTarget(inputEl, identity, itemId) {
+    const newValue = inputEl.value;
+    inputEl.style.background = '#fef9c3';
+
+    securePost({
+        action: 'update_target',
+        identity: identity,
+        item_id: itemId,
+        value: newValue
+    })
+    .then(res => {
+        if (res.status === 'success') {
+            inputEl.style.background = '#dcfce7';
+            setTimeout(() => inputEl.style.background = 'white', 1000);
+            if (targetsData[identity]) {
+                targetsData[identity][itemId] = parseFloat(newValue) || 0;
+            }
+        } else {
+            alert("Gagal: " + res.message);
+            inputEl.style.background = '#fee2e2';
+        }
+    })
+    .catch(() => {
+        inputEl.style.background = '#fee2e2';
+    });
+}
+
+// ==========================================
+// ACTIONS
+// ==========================================
+function deleteData(id) {
+    if (!confirm("Yakin ingin menghapus data ini?")) return;
+    securePost({ action: 'delete', id: id })
+    .then(res => {
+        if (res.status === 'success') {
+            showToast("✅ Data dihapus");
+            fetchData();
+        } else {
+            showToast("Gagal: " + res.message);
+        }
+    });
+}
+
+// ==========================================
+// HELPERS
+// ==========================================
+function switchTab(tabName) {
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.view-section').forEach(s => s.classList.remove('active'));
+
+    const nav = document.getElementById(`nav-${tabName}`);
+    const view = document.getElementById(`view-${tabName}`);
+    if (nav) nav.classList.add('active');
+    if (view) view.classList.add('active');
+
+    if (tabName === 'config' && user.role === 'Daerah') renderConfigTable();
+    if (tabName === 'targets' && user.role === 'Daerah') renderTargetsTable();
+    if (tabName === 'rekap') renderRecapTable();
+}
+
+function updateDesaFilterOptions() {
+    if (user.role !== 'Daerah') return;
+    const desas = [...new Set(allTransactions.map(t => t.desa))].filter(Boolean);
+    const selects = [document.getElementById('filter-data-desa'), document.getElementById('filter-rekap-desa')];
+    selects.forEach(sel => {
+        if (!sel) return;
+        sel.innerHTML = '<option value="">Semua Desa</option>';
+        desas.forEach(d => sel.innerHTML += `<option value="${d}">${d}</option>`);
+    });
+}
+
+// ==========================================
+// EXCEL EXPORT (Rekap)
+// ==========================================
+async function downloadExcel() {
+    const filterPeriodeRaw = document.getElementById('filter-rekap-periode').value;
+    const filterDesa = document.getElementById('filter-rekap-desa').value;
+
+    if (!filterPeriodeRaw) return showToast("Pilih periode dulu!");
+
+    const [year, month] = filterPeriodeRaw.split('-');
+    const dateObj = new Date(year, month - 1);
+    const namaPeriode = dateObj.toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+    let namaKelompok = (user.role === 'Kelompok' ? user.kelompok : ".........").toUpperCase();
+    let namaDesaDisplay = (user.desa || ".........").toUpperCase();
+
+    if (user.role === 'Daerah') {
+        namaDesaDisplay = filterDesa ? filterDesa.toUpperCase() : "";
+    }
+
+    let allowedCategories = [];
+    if (user.role === 'Daerah') allowedCategories = ['A', 'B', 'C', 'D'];
+    else if (user.role === 'Desa') allowedCategories = ['A', 'B', 'C', 'D', 'E'];
+    else if (user.role === 'Kelompok') allowedCategories = ['A', 'B', 'C', 'D', 'E', 'F'];
+
+    let reportTitle = user.role === 'Kelompok' ? "REKAPITULASI HIBAH BULANAN KELOMPOK KE DESA" :
+        (user.role === 'Desa' ? "REKAPITULASI HIBAH BULANAN DESA KE DAERAH" : "REKAPITULASI HIBAH BULANAN DAERAH");
+
+    let reportSubtitle = "";
+    if (user.role === 'Kelompok') reportSubtitle = `KELOMPOK ${namaKelompok} DESA ${namaDesaDisplay}`;
+    else if (user.role === 'Desa' || (user.role === 'Daerah' && filterDesa)) reportSubtitle = `DESA ${namaDesaDisplay}`;
+
+    let targetKey = user.role === 'Kelompok' ? user.kelompok : (user.role === 'Desa' ? user.desa : (filterDesa || "Daerah"));
+    const currentTargets = targetsData[targetKey] || {};
+
+    const categorizedData = {};
+    configData.forEach(conf => {
+        if (!allowedCategories.includes(conf.cat_code.toUpperCase())) return;
+        if (!categorizedData[conf.cat_title]) categorizedData[conf.cat_title] = [];
+
+        const realisasiBln = allTransactions.filter(t => {
+            const tPeriode = String(t.periode).trim();
+            let matchRole = true;
+            if (user.role === 'Kelompok') matchRole = t.kelompok === user.kelompok;
+            else if (user.role === 'Desa') matchRole = t.desa === user.desa;
+            else if (user.role === 'Daerah' && filterDesa) matchRole = t.desa === filterDesa;
+            return tPeriode === filterPeriodeRaw && matchRole;
+        }).reduce((acc, t) => {
+            let vals = {}; try { vals = JSON.parse(t.values_json); } catch (e) { }
+            return acc + (parseFloat(vals[conf.item_id]) || 0);
+        }, 0);
+
+        categorizedData[conf.cat_title].push({
+            cat_code: conf.cat_code,
+            label: conf.item_label,
+            target: parseFloat(currentTargets[conf.item_id]) || 0,
+            realisasi: realisasiBln
+        });
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Laporan');
+
+    worksheet.mergeCells('A1:E1');
+    worksheet.mergeCells('A2:E2');
+    worksheet.mergeCells('A3:E3');
+
+    worksheet.getCell('A1').value = reportTitle;
+    worksheet.getCell('A1').font = { bold: true, size: 14 };
+    worksheet.getCell('A1').alignment = { horizontal: 'center' };
+
+    worksheet.getCell('A2').value = reportSubtitle;
+    worksheet.getCell('A2').font = { bold: true, size: 11 };
+    worksheet.getCell('A2').alignment = { horizontal: 'center' };
+
+    worksheet.getCell('A3').value = "PERIODE " + namaPeriode;
+    worksheet.getCell('A3').font = { bold: true, size: 11 };
+    worksheet.getCell('A3').alignment = { horizontal: 'center' };
+
+    const headerRow = worksheet.addRow(['NO', 'URAIAN', 'TARGET', 'REALISASI', 'KETERANGAN']);
+    headerRow.eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E0E0' } };
+        cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+        cell.alignment = { horizontal: 'center' };
+    });
+
+    let counter = 1;
+    let grandTotalRealisasi = 0;
+    let totalHakKelompok = 0;
+    let totalHakDesa = 0;
+
+    for (const [catTitle, items] of Object.entries(categorizedData)) {
+        const cat = configData.find(c => c.cat_title === catTitle);
+        const catCode = cat ? cat.cat_code : '';
+
+        const catRow = worksheet.addRow(['', catTitle.toUpperCase(), '', '', '']);
+        catRow.getCell(2).font = { bold: true };
+
+        items.forEach(item => {
+            grandTotalRealisasi += item.realisasi;
+            if (catCode === 'F') totalHakKelompok += item.realisasi;
+            if (catCode === 'E') totalHakDesa += item.realisasi;
+
+            const row = worksheet.addRow([counter++, item.label, item.target, item.realisasi, ""]);
+            row.getCell(3).numFmt = '#,##0';
+            row.getCell(4).numFmt = '#,##0';
+        });
+    }
+
+    const footerRow = worksheet.addRow(['', 'TOTAL KESELURUHAN', '', grandTotalRealisasi, '']);
+    footerRow.eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFF00' } };
+    });
+    footerRow.getCell(4).numFmt = '#,##0';
+
+    let totalYangDisetor = 0;
+    let labelSetoran = "";
+
+    if (user.role === 'Kelompok') {
+        totalYangDisetor = grandTotalRealisasi - totalHakKelompok;
+        labelSetoran = "TOTAL YANG DISETOR KE DESA";
+    } else if (user.role === 'Desa') {
+        totalYangDisetor = grandTotalRealisasi - totalHakDesa;
+        labelSetoran = "TOTAL YANG DISETOR KE DAERAH";
+    }
+
+    if ((user.role === 'Kelompok' || user.role === 'Desa') && totalYangDisetor > 0) {
+        const setoranRow = worksheet.addRow(['', labelSetoran, '', totalYangDisetor, '']);
+        setoranRow.eachCell((cell) => {
+            cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F766E' } };
+            cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+        });
+        setoranRow.getCell(4).numFmt = '#,##0';
+    }
+
+    worksheet.getColumn(1).width = 5;
+    worksheet.getColumn(2).width = 45;
+    worksheet.getColumn(3).width = 18;
+    worksheet.getColumn(4).width = 18;
+    worksheet.getColumn(5).width = 20;
+
+    let fileName = (user.role === 'Kelompok' ? `Laporan_Kelompok_${namaKelompok}` :
+        (user.role === 'Desa' ? `Laporan_Desa_${namaDesaDisplay}` :
+            `Laporan_Daerah_Keseluruhan`)) + `_${filterPeriodeRaw}.xlsx`;
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
     window.URL.revokeObjectURL(url);
+    showToast("✅ File Excel berhasil didownload!");
 }
